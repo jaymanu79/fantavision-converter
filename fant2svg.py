@@ -164,9 +164,13 @@ def build(mv, step, arrival=False, debug=False, sound=True):
     yscale = 1.2 if H_ <= 200 else 1.0
     out = []
     a = out.append
+    # Outer SVG: fills the browser window, keeps the display aspect ratio (letterboxed in black).
+    # Inner SVG: Amiga pixel coordinates, stretched to the pixel aspect ratio and clipped.
+    DH = round(H_ * yscale)
     a('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
-      'viewBox="0 0 %d %d" width="%d" height="%d" preserveAspectRatio="none" '
-      'shape-rendering="crispEdges">' % (W_, H_, W_ * 2, round(H_ * 2 * yscale)))
+      'viewBox="0 0 %d %d" width="100%%" height="100%%" style="background:#000">' % (W_, DH))
+    a('<svg x="0" y="0" width="%d" height="%d" viewBox="0 0 %d %d" preserveAspectRatio="none" '
+      'shape-rendering="crispEdges">' % (W_, DH, W_, H_))
     a('<title>%s (Fantavision)</title>' % mv.get('name', 'movie'))
     a('<desc>%d keyframes, %d steps, %.1f s loop. Converted by fant2svg.</desc>' % (K, total, T))
     anim = 'dur="%ss" repeatCount="indefinite"' % fmt(T)
@@ -288,7 +292,7 @@ def build(mv, step, arrival=False, debug=False, sound=True):
     a('</g>')
     if sound:
         a(sound_block(mv, [tstart[k] * step for k in range(len(mv['frames']))], T, W_))
-    a('</svg>')
+    a('</svg></svg>')
     return '\n'.join(out), T, total
 
 # ---------------------------------------------------------------- sound (Web Audio)
