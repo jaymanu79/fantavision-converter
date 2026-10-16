@@ -25,7 +25,7 @@ python3 fant2svg.py MOVIE [output.svg] [--step 0.05] [--arrival] [--debug] [--no
 
 | Option | Effect |
 |---|---|
-| `--step S` | duration of one in-between step in seconds (default 0.05 s). The real speed was set by the player (keys 1–0, or `SPEED` in a script), not by the movie file |
+| `--step S` | duration of one step in seconds (default 0.05 s). The player draws *tweens* × 100 / *speed* steps per keyframe, with a speed of 100 by default, changed with keys 1–0 or `SPEED` in a script; it is not stored in the movie file |
 | `--arrival` | a keyframe's in-between count applies to the transition from the previous keyframe (default: to the next one) |
 | `--debug` | shows `$7000`-type objects, normally hidden, as dashed pink outlines |
 | `--no-sound` | leaves the sounds out (no script in the SVG) |
@@ -36,8 +36,11 @@ The movies are found in the `Movies` folder of the Fantavision disk. To extract 
 
 - Every object type of the player: filled polygons (optionally with a border in a second colour), lines, outlines, round and square dots, bitmaps, bitmaps stamped on each point, and text. Morphing works even when the number of points changes from one keyframe to the next (resampling).
 - "Comet" trails: objects flagged to leave a trace are painted step by step into the background.
-- Colours interpolated by palette index, step by step, with a palette per keyframe, and the background colour chosen in the header.
-- ILBM bitmaps (background and objects), converted to embedded PNG, cropped to their real size, with colour 0 transparent when the object asks for a mask.
+- Drawing order: on each keyframe the player sorts the objects by their id (`POLY` word 7), lowest drawn first; the SVG follows that order, even when it changes from one keyframe to the next.
+- Morphing towards the object in the same slot of the next keyframe, even when it is of another type (a bitmap can follow a one-point polygon, for instance).
+- Colours interpolated by palette index, step by step, with a palette per keyframe, and the background colour chosen in the header. Colour values above 32 are two-colour 8×8 area patterns, as in the player.
+- Filled polygons include their outline, as with the Amiga area fill, so one- and two-point polygons show as a dot or a line.
+- ILBM bitmaps (background and objects), converted to embedded PNG, cropped to their real size, with colour 0 transparent when the object asks for a mask. 6-plane pictures are decoded as HAM, and 400-line pictures as interlaced.
 - Text (`CSTR`), word-wrapped in its box, with a substitute browser font.
 - Repeated blocks of keyframes.
 - Objects appearing or disappearing between keyframes.
@@ -71,7 +74,7 @@ FORM FANT
 | Offset | Content |
 |---|---|
 | 0 | `$0040` |
-| 2 | `$0010` |
+| 2 | `$0010` (`$001E` in some later movies) |
 | 4 | depth (5 = 32 colours) |
 | 6, 8 | width, height (320×200, 352×276…) |
 | 10 | background colour: index of the colour the screen is cleared with (0, 2, 15 in the samples) |
@@ -80,6 +83,7 @@ FORM FANT
 | 78 | number of sounds |
 | 80 | number of bitmaps (excluding the background) |
 | 82 | background present (1 = the first ILBM is the background) |
+| 84 | unknown (275 in the TRON movies, 0 elsewhere) |
 
 ### FRAM
 
@@ -116,9 +120,9 @@ An 18-word header, followed by *n* (x, y) pairs.
 |---|---|
 | 0 | number of points *n* |
 | 1 | type (low byte) and flags (high byte), see below |
-| 2 | colour index |
+| 2 | colour: 0–32 palette index; above 32, area pattern *value* / 32 − 1 drawn with colours *value* & 31 and 31 − (*value* & 31) |
 | 3–6 | bounding box x1, y1, x2, y2 |
-| 7 | identifier (not used for matching) |
+| 7 | id: drawing order (objects are sorted by id on each keyframe, lowest drawn first) |
 | 8 | high byte: dot size (types 4 and 5); low byte: border style (0 = plain) |
 | 9 | low byte: second colour, for the border (flag `$4000`) |
 | 10–12 | bitmap: index, width, height (the point is the centre of the bitmap) |
@@ -139,12 +143,12 @@ Types, as dispatched by the player's drawing routine:
 
 Flags: `$1000` the bitmap is drawn through a mask (colour 0 transparent, otherwise it is copied as an opaque rectangle); `$2000` the object is also painted into the background on each step, leaving a trail; `$4000` border in the second colour (polygon outline, or a line joining the dots or stamps). An object whose flags word is exactly `$7000` is never drawn.
 
-Two consecutive keyframes are matched object by object, by their position in the list.
+Two consecutive keyframes are matched object by object, by their position in the list, whatever their types: during the in-betweens, an object takes the points and colour of its counterpart in the next keyframe. When there is no counterpart, or it is a `$7000` object, it stays still.
 
 ## Open questions
 
 - Whether the in-between count of a keyframe applies towards the next keyframe or from the previous one.
-- The playback speed of the original player.
+- The real frame rate of the original player, which depends on how fast the Amiga could draw each step.
 - Thick or patterned borders (low byte of `POLY` word 8), drawn here as a plain 1-pixel border.
 - Role of the invisible `$7000` objects.
 - In `SEFX`: the high byte of the volume word, the word at offset 2, and whether offset 4 really means one-shot versus loop.
@@ -153,6 +157,6 @@ Comparing with FantaPlayer under emulation, or reading more of its code, would s
 
 ## Movies (`movies/`)
 
-The `movies/` folder contains original `FORM FANT` files: the demo movies of the Amiga Fantavision disks (*!AmigaFantTitle*, *!FantMovie*, *Aliens*, *Anthropology*, *Atoms*, *Bird*, *BoingTheMovie*, *CarCrash!*, *CoolJay*, *Dinosaurs*, *Eye*, *Eyes*, *Jaws*, *LightHouse*, *Marilyn*, *NewYork*, *Party*, *VideoPie*, *WindyCove*) and *PA* (352×276, a PAL size, possibly not a Broderbund movie).
+The `movies/` folder contains original `FORM FANT` files: the demo movies of the Amiga Fantavision disks, movies found in disk archives (TRON, Franklin Fly, Happy Feet, Spy movie…), and `ANC`, the intro of the ANC Europe PAL version, recovered from the free space of a floppy image where it had been deleted (all 66 blocks were intact).
 
-Fantavision and its demo movies are © Broderbund.
+Fantavision and its demo movies are © Broderbund; the other movies belong to their authors.
