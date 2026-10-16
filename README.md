@@ -20,7 +20,7 @@ Then open the files in `svg-output/` in a web browser (some image viewers, such 
 For a single movie:
 
 ```bash
-python3 fant2svg.py MOVIE [output.svg] [--step 0.05] [--arrival] [--debug]
+python3 fant2svg.py MOVIE [output.svg] [--step 0.05] [--arrival] [--debug] [--no-sound]
 ```
 
 | Option | Effect |
@@ -28,6 +28,7 @@ python3 fant2svg.py MOVIE [output.svg] [--step 0.05] [--arrival] [--debug]
 | `--step S` | base duration of one in-between step in seconds (default 0.05 s), to which the header speed field / 60 s is added |
 | `--arrival` | a keyframe's in-between count applies to the transition from the previous keyframe (default: to the next one) |
 | `--debug` | shows `$7000`-type objects, normally hidden, as dashed pink outlines |
+| `--no-sound` | leaves the sounds out (no script in the SVG) |
 
 The movies are found in the `Movies` folder of the Fantavision disk. To extract them from an `.adf` image, any Amiga floppy (OFS) reader will do.
 
@@ -40,8 +41,13 @@ The movies are found in the `Movies` folder of the Fantavision disk. To extract 
 - Objects appearing or disappearing between keyframes.
 - Looping: if the last keyframe still contains objects, it morphs back into the first one.
 - Amiga pixel aspect ratio (NTSC 320×200 displayed as 4:3).
+- Sound: the 8SVX samples are embedded in the SVG and played with a small Web Audio script, on two channels like the original, with volume and pitch changes interpolated between keyframes.
 
-Not supported: 8SVX sounds (SVG cannot play audio) and Amiga bitmap fonts.
+Not supported: Amiga bitmap fonts.
+
+### Sound
+
+Browsers do not allow a page to play sound by itself, so movies with sound get a small **♪ off** button in the top-right corner. Clicking it restarts the movie from the beginning with sound; clicking again mutes it. The script only runs when the SVG is opened directly in a browser (or embedded with `<object>`/`<iframe>`), not through an `<img>` tag. Among the sample movies, only *Jaws* and *Dinosaurs* have sound.
 
 ## The FANT format
 
@@ -79,9 +85,22 @@ FORM FANT
 |---|---|
 | 0–7 | unknown (almost always 0) |
 | 8 | number of in-between frames |
-| 10, 12 | sounds triggered on two channels (-1 = none, -2 = stop?) |
+| 10, 12 | sound commands on two channels: index of the sound to start, -1 nothing, -2 change the playing sound (volume/pitch), -3 stop |
 | 14 | number of `POLY` chunks that follow |
 | 16 | keyframe palette: 32 `$0RGB` words |
+
+### 8SVX and SEFX
+
+The sounds are standard `FORM 8SVX` samples (8-bit signed, rate in `VHDR`). Each is followed by a 40-byte `SEFX` chunk holding its default settings. Inside a keyframe, one `SEFX` follows the `FRAM` for each channel that has a command (channel A first, then B), and gives the settings to apply at that keyframe:
+
+| Offset | Content |
+|---|---|
+| 0 | low byte: volume 0–63; high byte: flag (unknown) |
+| 2 | unknown (0, 4, 6) |
+| 4 | 256 = play once, 0 = loop (as interpreted here) |
+| 6 | Amiga period: rate = 3579545 / period (matches the `VHDR` rate) |
+| 8 | number of samples to play (32 bits) |
+| 12 | sound name, 20 bytes (`<Stop Sound>` for a stop command) |
 
 ### POLY
 
@@ -107,6 +126,7 @@ Two consecutive keyframes are matched object by object, by their position in the
 - Meaning of the `$1000`, `$2000`, `$4000` flags and of word 9 in `POLY`.
 - Role of the `$7000` objects.
 - First words of `FRAM`.
+- In `SEFX`: the high byte of the volume word, the word at offset 2, and whether offset 4 really means one-shot versus loop.
 
 The best way to settle these would be to compare with FantaPlayer under emulation, or to disassemble `fantaplayer`. Contributions are welcome.
 

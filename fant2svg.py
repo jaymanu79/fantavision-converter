@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fant2svg - convert Fantavision (Broderbund, Amiga) FORM FANT movies to animated SVG (SMIL).
 
-Usage: fant2svg.py MOVIE [OUT.svg] [--step SECONDS] [--arrival] [--debug]
+Usage: fant2svg.py MOVIE [OUT.svg] [--step SECONDS] [--arrival] [--debug] [--no-sound]
   --step: base duration of one in-between step (default 0.05 s), plus FHDR speed/60 s
 
 Format notes (reverse-engineered from the sample movies):
@@ -75,6 +75,23 @@ def png_bytes(img, palette, transparent):
     return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
             + chunk(b'IDAT', zlib.compress(bytes(raw), 9)) + chunk(b'IEND', b''))
 
+# ---------------------------------------------------------------- 8SVX / SEFX
+AMIGA_CLOCK = 3579545  # NTSC Paula clock: sample rate = clock / period
+
+def svx_decode(form):
+    o = 12; rate = 8000; body = b''
+    while o + 8 <= len(form):
+        cid = form[o:o+4]; sz = struct.unpack('>I', form[o+4:o+8])[0]
+        if cid == b'VHDR': rate = UW(form, o + 20)
+        if cid == b'BODY': body = form[o+8:o+8+sz]
+        o += 8 + sz + (sz & 1)
+    return dict(rate=rate, data=body)
+
+def sefx_decode(b):
+    w = [UW(b, 2*i) for i in range(6)]
+    return dict(volume=w[0] & 0xff, vflags=w[0] >> 8, oneshot=(w[2] == 256), period=w[3],
+                length=(w[4] << 16) | w[5], name=b[12:32].split(b'\0')[0].decode('latin1'))
+
 # ---------------------------------------------------------------- FANT parse
 def parse(data):
     assert data[:4] == b'FORM' and data[8:12] == b'FANT', 'not a FORM FANT file'
@@ -89,11 +106,15 @@ def parse(data):
             mv['nframes'], mv['nsounds'], mv['nbitmaps'], mv['hasbg'] = [UW(b, 76 + 2*i) for i in range(4)]
         elif cid == b'FORM' and b[:4] == b'ILBM':
             mv['ilbm'].append(ilbm_decode(data[o:o+8+sz]))
+        elif cid == b'FORM' and b[:4] == b'8SVX':
+            mv['sounds'].append(svx_decode(data[o:o+8+sz]))
         elif cid == b'SEFX':
-            pass
+            ev = sefx_decode(b)
+            if mv['frames']: mv['frames'][-1]['sefx'].append(ev)
+            else: mv.setdefault('sounddefs', []).append(ev)
         elif cid == b'FRAM':
             fr = dict(hdr=[W(b, 2*i) for i in range(8)], tweens=W(b, 8),
-                      palette=[UW(b, 16 + 2*i) for i in range(32)], polys=[])
+                      palette=[UW(b, 16 + 2*i) for i in range(32)], polys=[], sefx=[])
             mv['frames'].append(fr); pending_text = []
         elif cid == b'POLY':
             h = [W(b, 2*i) for i in range(18)]
@@ -123,7 +144,7 @@ def resample(pts, n):
 
 def fmt(t): return ('%.5f' % t).rstrip('0').rstrip('.') or '0'
 
-def build(mv, step, arrival=False, debug=False):
+def build(mv, step, arrival=False, debug=False, sound=True):
     frames = mv['frames']; K = len(frames)
     # duration (in steps) of each keyframe -> next keyframe segment
     seg = []
@@ -264,8 +285,68 @@ def build(mv, step, arrival=False, debug=False):
                 a('<image x="%s" y="%s" width="%d" height="%d" preserveAspectRatio="none" '
                   'style="image-rendering:pixelated" href="data:image/png;base64,%s">%s%s%s</image>' % (
                     fmt(x0), fmt(y0), p['h'][11], p['h'][12], bm_png[idx], vis, linear('x', kx), linear('y', ky)))
-    a('</g></svg>')
+    a('</g>')
+    if sound:
+        a(sound_block(mv, [tstart[k] * step for k in range(len(mv['frames']))], T, W_))
+    a('</svg>')
     return '\n'.join(out), T, total
+
+# ---------------------------------------------------------------- sound (Web Audio)
+SOUND_JS = r"""
+(function(){
+var svg=document.documentElement, btn=document.getElementById('fv-sound'), lab=document.getElementById('fv-sound-label');
+var BASE=22050, ctx=null, master=null, bufs={}, on=false, sched={}, chans=[{},{}], timer=null;
+function buf(i,len){var k=i+':'+len; if(bufs[k])return bufs[k];
+  var r=atob(SND[i]),n=Math.max(1,Math.min(len,r.length)),b=ctx.createBuffer(1,n,BASE),d=b.getChannelData(0);
+  for(var j=0;j<n;j++){var v=r.charCodeAt(j);d[j]=(v>127?v-256:v)/128;} return bufs[k]=b;}
+function stop(c,at){if(c.s){try{c.s.stop(at);}catch(x){} c.s=null;}}
+function play(e,at){var c=chans[e[1]], op=e[2];
+  if(op==0){stop(c,at); var s=ctx.createBufferSource(), g=ctx.createGain();
+    s.buffer=buf(e[3],e[7]); s.loop=!e[6]; s.playbackRate.setValueAtTime(e[5]/BASE,at);
+    g.gain.setValueAtTime(e[4],at); s.connect(g); g.connect(master); s.start(at); c.s=s; c.g=g;}
+  else if(op==1&&c.s){c.g.gain.linearRampToValueAtTime(e[4],at); if(e[5]>0)c.s.playbackRate.linearRampToValueAtTime(e[5]/BASE,at);}
+  else if(op==2)stop(c,at);}
+function tick(){var now=svg.getCurrentTime(), L=Math.floor(now/T), t0=ctx.currentTime;
+  for(var l=L;l<=L+1;l++)for(var i=0;i<EV.length;i++){var k=l+':'+i; if(sched[k])continue;
+    var at=t0+(l*T+EV[i][0]-now); if(at<t0-0.1){sched[k]=1;continue;} if(at>t0+0.3)continue;
+    sched[k]=1; play(EV[i],Math.max(at,t0));}}
+btn.addEventListener('click',function(){
+  if(!ctx){var A=window.AudioContext||window.webkitAudioContext; if(!A)return; ctx=new A(); master=ctx.createGain(); master.connect(ctx.destination);}
+  if(!on){ctx.resume(); svg.setCurrentTime(0); sched={}; chans=[{},{}]; timer=setInterval(tick,40); tick(); on=true; lab.textContent='\u266A on';}
+  else{clearInterval(timer); stop(chans[0],0); stop(chans[1],0); on=false; lab.textContent='\u266A off';}
+});
+})();
+"""
+
+def sound_block(mv, ktime, T, width):
+    """Button + script playing the 8SVX samples in sync with the SMIL timeline (Web Audio).
+    Events: [time, channel, op(0 start,1 change,2 stop), sound, volume, sample rate, oneshot, length]"""
+    if not mv['sounds']: return ''
+    ev = []
+    for k, fr in enumerate(mv['frames']):
+        fx = list(fr['sefx'])
+        for ch, code in enumerate((fr['hdr'][5], fr['hdr'][6])):
+            if code == -1: continue
+            fxe = fx.pop(0) if fx else None
+            if code >= 0 and fxe and code < len(mv['sounds']):
+                ev.append([ktime[k], ch, 0, code, fxe['volume'] / 64,
+                           round(AMIGA_CLOCK / max(fxe['period'], 1)), int(fxe['oneshot']), fxe['length']])
+            elif code == -2 and fxe:
+                ev.append([ktime[k], ch, 1, 0, fxe['volume'] / 64,
+                           round(AMIGA_CLOCK / fxe['period']) if fxe['period'] else 0, 0, 0])
+            else:
+                ev.append([ktime[k], ch, 2, 0, 0, 0, 0, 0])
+    if not ev: return ''
+    ev += [[T - 0.001, 0, 2, 0, 0, 0, 0, 0], [T - 0.001, 1, 2, 0, 0, 0, 0, 0]]  # silence at loop end
+    ev.sort(key=lambda e: e[0])
+    evs = ','.join('[%s,%d,%d,%d,%s,%d,%d,%d]' % (fmt(e[0]), e[1], e[2], e[3], fmt(e[4]), e[5], e[6], e[7]) for e in ev)
+    snd = ','.join('"%s"' % base64.b64encode(x['data']).decode() for x in mv['sounds'])
+    return ('<g id="fv-sound" style="cursor:pointer" font-family="sans-serif" font-size="8">'
+            '<title>Sound on/off (restarts the movie)</title>'
+            '<rect x="%d" y="3" width="34" height="12" rx="3" fill="#000" fill-opacity="0.55" stroke="#fff" stroke-opacity="0.6" stroke-width="0.5"/>'
+            '<text id="fv-sound-label" x="%d" y="12" fill="#fff" text-anchor="middle">\u266a off</text></g>\n'
+            '<script><![CDATA[\nvar T=%s, EV=[%s], SND=[%s];%s]]></script>' % (
+                width - 37, width - 20, fmt(T), evs, snd, SOUND_JS))
 
 if __name__ == '__main__':
     args = [x for x in sys.argv[1:] if not x.startswith('--')]
@@ -276,6 +357,7 @@ if __name__ == '__main__':
     mv = parse(open(src, 'rb').read())
     mv['name'] = src.rsplit('/', 1)[-1]
     st = step + mv['speed'] / 60   # speed word read as extra delay in 1/60 s ticks
-    svg, T, total = build(mv, st, arrival='--arrival' in sys.argv, debug='--debug' in sys.argv)
+    svg, T, total = build(mv, st, arrival='--arrival' in sys.argv, debug='--debug' in sys.argv,
+                         sound='--no-sound' not in sys.argv)
     open(dst, 'w').write(svg)
     print('%s: %d keyframes, %d steps, %.1fs -> %s (%d bytes)' % (src, len(mv['frames']), total, T, dst, len(svg)))
