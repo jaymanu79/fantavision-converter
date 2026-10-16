@@ -2,19 +2,22 @@
 """fant2svg - convert Fantavision (Broderbund, Amiga) FORM FANT movies to animated SVG (SMIL).
 
 Usage: fant2svg.py MOVIE [OUT.svg] [--step SECONDS] [--arrival] [--debug] [--no-sound]
-  --step: base duration of one in-between step (default 0.05 s), plus FHDR speed/60 s
+  --step: duration of one in-between step (default 0.05 s)
 
-Format notes (reverse-engineered from the sample movies):
+Format notes (from the sample movies and a disassembly of FantaPlayer, 3/9/88):
   FORM FANT
-    FHDR (92)  : w 0x40, w 0x10, w depth, w width, w height, w speed,
+    FHDR (92)  : w $40, w $10, w depth, w width, w height, w background colour index,
                  32 x w palette ($0RGB), w nFrames, w nSounds, w nBitmaps, w hasBackground, pad
-    FORM ILBM* : background (if hasBackground) then bitmaps (masking = transparent colour 0)
-    FORM 8SVX + SEFX : sounds (ignored here, SVG has no audio)
-    FRAM (88)  : 4 w ?, w tweens, w sndA, w sndB, w nPolys, 32 x w palette, 8 x 0
+    FORM ILBM* : background (if hasBackground) then bitmaps
+    FORM 8SVX + SEFX : sounds and their default settings
+    FRAM (88)  : w mode (1 = repeat block), l block end frame, b repeat count, b ?, w tweens,
+                 w sound A, w sound B, w nPolys, 32 x w palette, 3 x w ?, w 0
+    SEFX       : one per sound command of the keyframe (channel A, then B)
     POLY*      : 18 w header + n x (x,y) signed words
-                 h0 nPoints, h1 flags/type, h2 colour index, h3..h6 bbox x1 y1 x2 y2,
-                 h7 id, h8 256, h9 ?, h10 bitmap index, h11 bm width, h12 bm height,
-                 h13 text length, h14 ?, h15 font size << 8
+                 h0 nPoints, h1 type (low byte) | flags $1000 mask $2000 trail $4000 border,
+                 $7000 = invisible; h2 colour, h3..h6 bbox, h7 id, h8 size << 8 | ?,
+                 h9 border colour (low byte), h10 bitmap index, h11/h12 bitmap width/height,
+                 h13 text length, h15 font size << 8
     CSTR       : text string then font name, for each text object of the frame
 """
 import struct, sys, io, base64, zlib
@@ -101,7 +104,7 @@ def parse(data):
         cid = data[o:o+4]; sz = struct.unpack('>I', data[o+4:o+8])[0]
         b = data[o+8:o+8+sz]
         if cid == b'FHDR':
-            mv['w'], mv['h'], mv['speed'] = W(b, 6), W(b, 8), W(b, 10)
+            mv['w'], mv['h'], mv['bgcolor'] = W(b, 6), W(b, 8), W(b, 10)
             mv['palette'] = [UW(b, 12 + 2*i) for i in range(32)]
             mv['nframes'], mv['nsounds'], mv['nbitmaps'], mv['hasbg'] = [UW(b, 76 + 2*i) for i in range(4)]
         elif cid == b'FORM' and b[:4] == b'ILBM':
@@ -132,27 +135,65 @@ def parse(data):
     return mv
 
 def kind(p):
+    """Object type, as dispatched by FantaPlayer's draw routine (low byte of the flags word)."""
     f = p['flags']
-    if f & 0x7000 == 0x7000: return 'hidden'
-    t = f & 7
-    return {0: 'fill', 1: 'line', 2: 'outline', 3: 'text', 7: 'bitmap'}.get(t, 'fill')
+    if f == 0x7000: return 'hidden'          # never drawn by the player
+    return {0: 'fill', 1: 'line', 2: 'outline', 3: 'text', 4: 'dots', 5: 'squares',
+            6: 'stamps', 7: 'bitmap'}.get(f & 0xff, 'fill')
+
+FLAG_MASK = 0x1000     # bitmap drawn through a mask (colour 0 transparent)
+FLAG_TRAIL = 0x2000    # object is also painted into the background ("comet" trail)
+FLAG_BORDER = 0x4000   # second colour: polygon border / line joining dots or stamps
 
 # ---------------------------------------------------------------- SVG output
 def resample(pts, n):
     m = len(pts)
     return [pts[(k * m) // n] for k in range(n)]
 
+def lerp_pts(a, b, t):
+    n = max(len(a), len(b)); a, b = resample(a, n), resample(b, n)
+    return [(round(x0 + (x1 - x0) * t), round(y0 + (y1 - y0) * t)) for (x0, y0), (x1, y1) in zip(a, b)]
+
+def wrap_text(text, width):
+    """Word-wrap like a text box: explicit newlines, then words up to <width> characters per line."""
+    out = []
+    for para in text.replace('\r', '\n').split('\n'):
+        line = ''
+        for word in para.split(' '):
+            cand = (line + ' ' + word) if line else word
+            if len(cand) <= width or not line:
+                line = cand
+            else:
+                out.append(line); line = word
+        out.append(line.rstrip())
+    return out
+
 def fmt(t): return ('%.5f' % t).rstrip('0').rstrip('.') or '0'
 
+def sequence(frames):
+    """Frame order, unrolling the 'repeat' blocks (FRAM word 0 = 1: repeat this keyframe up to
+    keyframe <long at offset 2>, <byte at offset 6> times)."""
+    seq, i, loops = [], 0, {}
+    while i < len(frames) and len(seq) < 10000:
+        seq.append(i); h = frames[i]['hdr']
+        if h[0] == 1 and i not in loops:
+            tgt = ((h[1] & 0xffff) << 16) | (h[2] & 0xffff)
+            loops[i] = [tgt, max(((h[3] >> 8) & 0xff) - 1, 0)]
+        back = [s for s, (tgt, left) in loops.items() if tgt == i and left > 0]
+        if back:
+            loops[back[0]][1] -= 1; i = back[0]
+        else:
+            i += 1
+    return seq
+
 def build(mv, step, arrival=False, debug=False, sound=True):
-    frames = mv['frames']; K = len(frames)
-    # duration (in steps) of each keyframe -> next keyframe segment
+    order = sequence(mv['frames'])
+    frames = [mv['frames'][j] for j in order]; K = len(frames)
     seg = []
     for k in range(K):
         tw = frames[(k + 1) % K]['tweens'] if arrival else frames[k]['tweens']
         seg.append(max(tw, 0) + 1)
-    # Looping: if the last keyframe still shows objects, morph it back into the first one
-    # (a virtual copy of keyframe 0 placed at the very end of the timeline).
+    # Looping: if the last keyframe still shows objects, morph it back into the first one.
     if frames[-1]['polys']:
         frames = frames + [frames[0]]; seg.append(0); K += 1
     tstart = [0]
@@ -197,101 +238,209 @@ def build(mv, step, arrival=False, debug=False, sound=True):
                 % (attr, ';'.join(v for _, v in ks), ';'.join(fmt(kt(s)) for s, _ in ks), anim))
 
     def palette_at(k): return frames[k]['palette']
+    def first(v, *alts): return v
 
-    # background colour (colour 0 of each keyframe palette)
-    a('<rect x="-1000" y="-1000" width="%d" height="%d" fill="%s">%s</rect>' % (
-        W_ + 2000, H_ + 2000, rgb(palette_at(0)[0]),
-        discrete('fill', [(tstart[k], rgb(palette_at(k)[0])) for k in range(K)])))
+    # background: cleared with colour <FHDR word 5> of the current palette (if < 32)
+    bgi = mv['bgcolor'] if 0 <= mv['bgcolor'] < 32 else 0
+    a('<rect x="-10" y="-10" width="%d" height="%d" fill="%s">%s</rect>' % (
+        W_ + 20, H_ + 20, rgb(palette_at(0)[bgi]),
+        discrete('fill', [(tstart[k], rgb(palette_at(k)[bgi])) for k in range(K)])))
 
+    # bitmaps are drawn with the palette of the first keyframe
+    pal0 = mv['frames'][0]['palette'] if any(mv['frames'][0]['palette']) else mv['palette']
     bms = list(mv['ilbm'])
     if mv['hasbg'] and bms:
         bg = bms.pop(0)
-        png = png_bytes(bg, mv['palette'], False)
         a('<image x="0" y="0" width="%d" height="%d" preserveAspectRatio="none" style="image-rendering:pixelated" '
-          'href="data:image/png;base64,%s"/>' % (bg['w'], bg['h'], base64.b64encode(png).decode()))
-    bm_png = [base64.b64encode(png_bytes(b, mv['palette'], True)).decode() for b in bms]
+          'href="data:image/png;base64,%s"/>' % (bg['w'], bg['h'], base64.b64encode(png_bytes(bg, pal0, False)).decode()))
+    masked = set(p['h'][10] for f in mv['frames'] for p in f['polys']
+                 if kind(p) in ('bitmap', 'stamps') and p['flags'] & FLAG_MASK)
+    # bitmaps are stored padded to a multiple of 16 pixels: crop them to the size the object gives
+    def bmkey(p):
+        i = p['h'][10]
+        return (i, min(p['h'][11], bms[i]['w']) or bms[i]['w'], min(p['h'][12], bms[i]['h']) or bms[i]['h'])
+    used = sorted(set(bmkey(p) for f in mv['frames'] for p in f['polys']
+                      if kind(p) in ('bitmap', 'stamps') and 0 <= p['h'][10] < len(bms)))
+    bmid = lambda p: 'bm%d_%d_%d' % bmkey(p)
+    if used:
+        a('<defs>')
+        for i, w, h in used:
+            img = dict(bms[i], w=w, h=h, pix=[row[:w] for row in bms[i]['pix'][:h]])
+            a('<image id="bm%d_%d_%d" width="%d" height="%d" preserveAspectRatio="none" style="image-rendering:pixelated" '
+              'href="data:image/png;base64,%s"/>' % (i, w, h, w, h,
+                base64.b64encode(png_bytes(img, pal0, i in masked)).decode()))
+        a('</defs>')
+    has_bm = lambda p: 0 <= p['h'][10] < len(bms)
 
-    a('<g fill-rule="evenodd" stroke-linejoin="round">')
+    def col(k, ci): return rgb(palette_at(k)[ci & 31])
+
+    def colour_changes(run, field):
+        """Colour index tweened step by step between keyframes, as (step, '#rgb') changes."""
+        cols = []
+        for j, (k, p) in enumerate(run):
+            nxt = run[j + 1][1] if j + 1 < len(run) else None
+            c0 = field(p)
+            if nxt is None or field(nxt) == c0:
+                cols.append((tstart[k], col(k, c0)))
+            else:
+                S = seg[k]
+                for st in range(S):
+                    cols.append((tstart[k] + st, col(k, round(c0 + (field(nxt) - c0) * st / S))))
+        return cols
+
+    color1 = lambda p: p['color']
+    color2 = lambda p: p['h'][9] & 0xff
+
+    # runs of consecutive compatible keyframes, per object slot (objects are matched by position)
     nslots = max(len(f['polys']) for f in frames)
-    elements = []  # (slot, start step) for z-order: keep slot order
+    runs_by_slot = []
     for i in range(nslots):
-        # split into runs of consecutive compatible keyframes
         runs = []; cur = None
         for k in range(K):
             p = frames[k]['polys'][i] if i < len(frames[k]['polys']) else None
-            if p is None or (debug is False and kind(p) == 'hidden'):
+            if p is None or (not debug and kind(p) == 'hidden'):
                 cur = None; continue
             prev = cur[-1][1] if cur else None
-            if prev and kind(prev) == kind(p) and (kind(p) != 'bitmap' or prev['h'][10] == p['h'][10]) \
+            if prev and kind(prev) == kind(p) and (kind(p) not in ('bitmap', 'stamps') or prev['h'][10] == p['h'][10]) \
                     and (kind(p) != 'text' or prev.get('text') == p.get('text')):
                 cur.append((k, p))
             else:
                 cur = [(k, p)]; runs.append(cur)
+        runs_by_slot.append(runs)
+
+    def shape(kd, pts, p, fill, extra=''):
+        """Static SVG for one object (used for trails)."""
+        P = ' '.join('%d,%d' % xy for xy in pts)
+        if kd == 'fill':
+            stroke = ' stroke="%s"' % extra if extra else ''
+            return '<polygon points="%s" fill="%s"%s/>' % (P, fill, stroke)
+        if kd in ('line', 'outline'):
+            return '<%s points="%s" fill="none" stroke="%s"/>' % ('polyline' if kd == 'line' else 'polygon', P, fill)
+        if kd in ('dots', 'squares'):
+            sz = max((p['h'][8] >> 8) & 0xff, 1)
+            return ''.join('<rect x="%s" y="%s" width="%d" height="%d" fill="%s"/>' % (
+                fmt(x - sz / 2 if sz > 1 else x), fmt(y - sz / 2 if sz > 1 else y), sz, sz, fill) for x, y in pts)
+        if kd in ('bitmap', 'stamps') and has_bm(p):
+            return ''.join('<use href="#%s" x="%s" y="%s"/>' % (bmid(p), fmt(x - p['h'][11] / 2), fmt(y - p['h'][12] / 2))
+                           for x, y in (pts if kd == 'stamps' else pts[:1]))
+        return ''
+
+    # ---- trails: objects flagged 0x2000 are also painted, step by step, into the background
+    trails = []
+    for runs in runs_by_slot:
+        for run in runs:
+            kd = kind(run[0][1])
+            for j, (k, p) in enumerate(run):
+                if not p['flags'] & FLAG_TRAIL or kd in ('text', 'hidden'): continue
+                nxt = run[j + 1][1] if j + 1 < len(run) else None
+                S = seg[k] if nxt is not None else 1
+                for st in range(S):
+                    s = tstart[k] + st
+                    if s >= total: break
+                    t = st / S
+                    pts = lerp_pts(p['pts'], nxt['pts'], t) if nxt is not None else p['pts']
+                    ci = round(p['color'] + ((nxt['color'] - p['color']) * t if nxt is not None else 0))
+                    c2 = col(k, color2(p)) if p['flags'] & FLAG_BORDER else ''
+                    el = shape(kd, pts, p, col(k, ci), c2)
+                    if el:
+                        vis = discrete('visibility', [(0, 'hidden'), (s, 'visible')]) if s > 0 else ''
+                        trails.append('<g>%s%s</g>' % (el, vis) if vis else el)
+    if trails:
+        a('<g fill-rule="evenodd" stroke-linejoin="round">'); out.extend(trails); a('</g>')
+
+    # ---- objects
+    a('<g fill-rule="evenodd" stroke-linejoin="round">')
+    for runs in runs_by_slot:
         for run in runs:
             k0, kl = run[0][0], run[-1][0]
             s0, s1 = tstart[k0], tstart[kl + 1]
             if s0 >= total: continue
-            kd = kind(run[0][1])
+            p0 = run[0][1]
+            kd = kind(p0)
             vis = discrete('visibility', [(0, 'hidden'), (s0, 'visible'), (s1, 'hidden')]) \
                 if (s0 > 0 or s1 < total) else ''
-            # colour: index tweened step by step between keyframes
-            cols = []
-            for j, (k, p) in enumerate(run):
-                nxt = run[j + 1][1] if j + 1 < len(run) else None
-                pal = palette_at(k)
-                if nxt is None or nxt['color'] == p['color']:
-                    cols.append((tstart[k], rgb(pal[p['color'] & 31])))
-                else:
-                    S = seg[k]
-                    for st in range(S):
-                        ci = round(p['color'] + (nxt['color'] - p['color']) * st / S)
-                        cols.append((tstart[k] + st, rgb(pal[ci & 31])))
+            cols = colour_changes(run, color1)
             c0 = cols[0][1]
-            canim_attr = 'stroke' if kd in ('line', 'outline') else 'fill'
-            canim = discrete(canim_attr, cols)
+            border = bool(p0['flags'] & FLAG_BORDER)
+            cols2 = colour_changes(run, color2) if border else None
+            N = max(p['n'] for _, p in run)
+            ptkeys = [(tstart[k], resample(p['pts'], N)) for k, p in run]
+            keys = [(s, ' '.join('%d,%d' % xy for xy in pts)) for s, pts in ptkeys]
             if kd in ('fill', 'line', 'outline', 'hidden'):
-                N = max(p['n'] for _, p in run)
-                keys = [(tstart[k], ' '.join('%d,%d' % xy for xy in resample(p['pts'], N))) for k, p in run]
                 tag = 'polyline' if kd == 'line' else 'polygon'
                 if kd == 'hidden':
-                    style = 'fill="none" stroke="#f0f" stroke-dasharray="2" stroke-width="0.5"'
+                    style, canim = 'fill="none" stroke="#f0f" stroke-dasharray="2" stroke-width="0.5"', ''
                 elif kd == 'fill':
                     style = 'fill="%s"' % c0
+                    canim = discrete('fill', cols)
+                    if border:
+                        style += ' stroke="%s" stroke-width="1"' % cols2[0][1]
+                        canim += discrete('stroke', cols2)
                 else:
                     style = 'fill="none" stroke="%s" stroke-width="1"' % c0
+                    canim = discrete('stroke', cols)
                 a('<%s points="%s" %s>%s%s%s</%s>' % (tag, keys[0][1], style, vis,
-                  linear('points', keys), canim if kd != 'hidden' else '', tag))
+                  linear('points', keys), canim, tag))
+            elif kd in ('dots', 'squares', 'stamps'):
+                if kd == 'stamps' and not has_bm(p0): continue
+                g = []
+                if border:   # line joining the points, drawn after them in the second colour
+                    pass
+                sz = max((p0['h'][8] >> 8) & 0xff, 1)
+                for j in range(N):
+                    if kd == 'stamps':
+                        ox, oy = p0['h'][11] / 2, p0['h'][12] / 2
+                        kx = [(s, fmt(pts[j][0] - ox)) for s, pts in ptkeys]
+                        ky = [(s, fmt(pts[j][1] - oy)) for s, pts in ptkeys]
+                        g.append('<use href="#%s" x="%s" y="%s">%s%s</use>' % (
+                            bmid(p0), kx[0][1], ky[0][1], linear('x', kx), linear('y', ky)))
+                    elif kd == 'dots' and sz > 1:
+                        kx = [(s, str(pts[j][0])) for s, pts in ptkeys]
+                        ky = [(s, str(pts[j][1])) for s, pts in ptkeys]
+                        g.append('<circle cx="%s" cy="%s" r="%s">%s%s</circle>' % (
+                            kx[0][1], ky[0][1], fmt(sz / 2), linear('cx', kx), linear('cy', ky)))
+                    else:
+                        off = sz / 2 if sz > 1 else 0
+                        kx = [(s, fmt(pts[j][0] - off)) for s, pts in ptkeys]
+                        ky = [(s, fmt(pts[j][1] - off)) for s, pts in ptkeys]
+                        g.append('<rect x="%s" y="%s" width="%d" height="%d">%s%s</rect>' % (
+                            kx[0][1], ky[0][1], sz, sz, linear('x', kx), linear('y', ky)))
+                if border:
+                    g.append('<polygon points="%s" fill="none" stroke="%s" stroke-width="1">%s%s</polygon>' % (
+                        keys[0][1], cols2[0][1], linear('points', keys), discrete('stroke', cols2)))
+                a('<g fill="%s">%s%s%s</g>' % (c0, vis, discrete('fill', cols) if kd != 'stamps' else '', ''.join(g)))
             elif kd == 'text':
-                p = run[0][1]
-                x1, y1, x2, y2 = p['bbox']
-                fs = (p['h'][15] >> 8) or (y2 - y1)
-                keysx = [(tstart[k], str(q['bbox'][0])) for k, q in run]
-                keysy = [(tstart[k], str(q['bbox'][3] - 2)) for k, q in run]
-                txt = (p.get('text', '') or '').replace('&', '&amp;').replace('<', '&lt;')
-                a('<text x="%d" y="%d" font-family="\'Poiret One\',\'Limelight\',Georgia,serif" font-size="%d" '
-                  'textLength="%d" lengthAdjust="spacingAndGlyphs" fill="%s">%s%s%s%s</text>' % (
-                    x1, y2 - 2, y2 - y1, x2 - x1, c0, txt, vis, linear('x', keysx), linear('y', keysy)) + canim)
-                # canim placed outside text content would be invalid; fix below
-                out[-1] = out[-1].replace('</text>' + canim, canim + '</text>') if canim else out[-1]
+                x1, y1, x2, y2 = p0['bbox']
+                font = (p0.get('font') or 'topaz.font').lower()
+                size = (p0['h'][15] >> 8) & 0xff or (y2 - y1)
+                mono = font.startswith(('topaz', 'small'))
+                cw = size if font.startswith('topaz') else size * (1.0 if mono else 0.62)
+                lines = wrap_text(p0.get('text', '') or '', max(int((x2 - x1 + 1) // cw), 1))
+                lh = size + 1
+                family = "'Topaz','Topaz New',monospace" if mono else "'Arial Black','Impact',sans-serif"
+                g = []
+                for j, line in enumerate(lines):
+                    if not line: continue
+                    tl = min(len(line) * cw, x2 - x1 + 1)
+                    g.append('<text x="%d" y="%s" font-size="%s" textLength="%s" lengthAdjust="spacingAndGlyphs">%s</text>' % (
+                        x1, fmt(y1 + (j + 1) * lh - size * 0.18), fmt(size * 1.1), fmt(tl),
+                        line.replace('&', '&amp;').replace('<', '&lt;')))
+                tr = [(tstart[k], '%d,%d' % (q['bbox'][0] - x1, q['bbox'][1] - y1)) for k, q in run]
+                move = linear('transform', tr).replace('<animate ', '<animateTransform type="translate" ') if len(set(v for _, v in tr)) > 1 else ''
+                a('<g font-family="%s" fill="%s" xml:space="preserve">%s%s%s%s</g>' % (
+                    family, c0, vis, move, discrete('fill', cols), ''.join(g)))
             elif kd == 'bitmap':
-                p = run[0][1]
-                idx = p['h'][10]
-                if idx >= len(bm_png):
-                    continue
-                bw, bh = bms[idx]['w'], bms[idx]['h']
-                flip = bool(p['flags'] & 0x2000) and not (p['flags'] & 0x1000)
+                if not has_bm(p0): continue
                 def bxy(q):
                     cx, cy = q['pts'][0]
                     return cx - q['h'][11] / 2, cy - q['h'][12] / 2
                 kx = [(tstart[k], fmt(bxy(q)[0])) for k, q in run]
                 ky = [(tstart[k], fmt(bxy(q)[1])) for k, q in run]
-                x0, y0 = bxy(p)
-                a('<image x="%s" y="%s" width="%d" height="%d" preserveAspectRatio="none" '
-                  'style="image-rendering:pixelated" href="data:image/png;base64,%s">%s%s%s</image>' % (
-                    fmt(x0), fmt(y0), p['h'][11], p['h'][12], bm_png[idx], vis, linear('x', kx), linear('y', ky)))
+                a('<use href="#%s" x="%s" y="%s">%s%s%s</use>' % (
+                    bmid(p0), kx[0][1], ky[0][1], vis, linear('x', kx), linear('y', ky)))
     a('</g>')
     if sound:
-        a(sound_block(mv, [tstart[k] * step for k in range(len(mv['frames']))], T, W_))
+        a(sound_block(mv, [(tstart[k] * step, order[k]) for k in range(len(order))], T, W_))
     a('</svg></svg>')
     return '\n'.join(out), T, total
 
@@ -322,24 +471,25 @@ btn.addEventListener('click',function(){
 })();
 """
 
-def sound_block(mv, ktime, T, width):
+def sound_block(mv, keys, T, width):
     """Button + script playing the 8SVX samples in sync with the SMIL timeline (Web Audio).
     Events: [time, channel, op(0 start,1 change,2 stop), sound, volume, sample rate, oneshot, length]"""
     if not mv['sounds']: return ''
     ev = []
-    for k, fr in enumerate(mv['frames']):
+    for t, fi in keys:
+        fr = mv['frames'][fi]
         fx = list(fr['sefx'])
         for ch, code in enumerate((fr['hdr'][5], fr['hdr'][6])):
             if code == -1: continue
             fxe = fx.pop(0) if fx else None
             if code >= 0 and fxe and code < len(mv['sounds']):
-                ev.append([ktime[k], ch, 0, code, fxe['volume'] / 64,
+                ev.append([t, ch, 0, code, fxe['volume'] / 64,
                            round(AMIGA_CLOCK / max(fxe['period'], 1)), int(fxe['oneshot']), fxe['length']])
             elif code == -2 and fxe:
-                ev.append([ktime[k], ch, 1, 0, fxe['volume'] / 64,
+                ev.append([t, ch, 1, 0, fxe['volume'] / 64,
                            round(AMIGA_CLOCK / fxe['period']) if fxe['period'] else 0, 0, 0])
             else:
-                ev.append([ktime[k], ch, 2, 0, 0, 0, 0, 0])
+                ev.append([t, ch, 2, 0, 0, 0, 0, 0])
     if not ev: return ''
     ev += [[T - 0.001, 0, 2, 0, 0, 0, 0, 0], [T - 0.001, 1, 2, 0, 0, 0, 0, 0]]  # silence at loop end
     ev.sort(key=lambda e: e[0])
@@ -360,8 +510,7 @@ if __name__ == '__main__':
     src = args[0]; dst = args[1] if len(args) > 1 else src + '.svg'
     mv = parse(open(src, 'rb').read())
     mv['name'] = src.rsplit('/', 1)[-1]
-    st = step + mv['speed'] / 60   # speed word read as extra delay in 1/60 s ticks
-    svg, T, total = build(mv, st, arrival='--arrival' in sys.argv, debug='--debug' in sys.argv,
+    svg, T, total = build(mv, step, arrival='--arrival' in sys.argv, debug='--debug' in sys.argv,
                          sound='--no-sound' not in sys.argv)
     open(dst, 'w').write(svg)
     print('%s: %d keyframes, %d steps, %.1fs -> %s (%d bytes)' % (src, len(mv['frames']), total, T, dst, len(svg)))
