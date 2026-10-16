@@ -1,6 +1,6 @@
 #!/bin/sh
-# Convertit tous les films Fantavision de movies/ en SVG animés dans svg-output/.
-# Usage : ./convert-movies.sh [options passées à fant2svg.py, ex. --step 0.04]
+# Converts every Fantavision movie in movies/ to an animated SVG in svg-output/.
+# Usage: ./convert-movies.sh [options passed to fant2svg.py, e.g. --step 0.04]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p svg-output
@@ -12,4 +12,4 @@ for f in movies/*; do
     python3 fant2svg.py "$f" "svg-output/$name.svg" "$@"
     n=$((n + 1))
 done
-echo "$n film(s) converti(s) dans svg-output/"
+echo "$n movie(s) converted to svg-output/"

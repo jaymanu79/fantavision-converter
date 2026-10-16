@@ -1,117 +1,117 @@
 # fantavision-converter
 
-Convertisseur des animations **Fantavision** (Broderbund, Amiga, 1988) vers des **SVG animés** lisibles dans n'importe quel navigateur (Firefox, Chrome, Safari, Edge).
+Converts **Fantavision** animations (Broderbund, Amiga, 1988) into **animated SVG** files that play in any web browser (Firefox, Chrome, Safari, Edge).
 
-Fantavision est un logiciel d'animation vectorielle à images clés : le fichier ne contient que des polygones aux images clés, et le lecteur calcule les images intermédiaires par interpolation (« tweening »). Le SVG produit fait exactement la même chose grâce aux animations SMIL (`<animate attributeName="points">`), sans JavaScript. Les fichiers restent minuscules (1 à 60 Ko) et nets à toutes les tailles.
+Fantavision is a keyframe-based vector animation program: a movie file only stores polygons at keyframes, and the player computes the in-between frames by interpolation ("tweening"). The generated SVG does exactly the same thing using SMIL animations (`<animate attributeName="points">`), with no JavaScript. The files stay tiny (1 to 60 KB) and sharp at any size.
 
-## Utilisation
+## Usage
 
-Python 3, aucune dépendance.
+Python 3, no dependencies.
 
-Pour convertir tous les films du dossier `movies/` d'un coup :
-
-```bash
-./convert-movies.sh              # écrit les SVG dans svg-output/
-./convert-movies.sh --step 0.04  # les options sont transmises à fant2svg.py
-```
-
-Ouvrez ensuite les fichiers de `svg-output/` dans un navigateur (la visionneuse d'images d'Ubuntu, par exemple, ne joue pas les animations SVG). Les SVG ne sont pas versionnés : ils se régénèrent à partir des sources.
-
-Pour un seul film :
+To convert every movie in the `movies/` folder at once:
 
 ```bash
-python3 fant2svg.py FILM [sortie.svg] [--step 0.05] [--arrival] [--debug]
+./convert-movies.sh              # writes the SVG files to svg-output/
+./convert-movies.sh --step 0.04  # options are passed through to fant2svg.py
 ```
 
-| Option | Effet |
+Then open the files in `svg-output/` in a web browser (some image viewers, such as Ubuntu's default one, do not play SVG animations). The SVG files are not versioned: they are regenerated from the sources.
+
+For a single movie:
+
+```bash
+python3 fant2svg.py MOVIE [output.svg] [--step 0.05] [--arrival] [--debug]
+```
+
+| Option | Effect |
 |---|---|
-| `--step S` | durée de base d'une étape intermédiaire en secondes (défaut 0,05 s), à laquelle s'ajoute le champ vitesse de l'en-tête / 60 s |
-| `--arrival` | le nombre d'intermédiaires d'une image clé compte depuis la précédente (par défaut : vers la suivante) |
-| `--debug` | affiche en pointillés roses les objets de type `$7000`, normalement masqués |
+| `--step S` | base duration of one in-between step in seconds (default 0.05 s), to which the header speed field / 60 s is added |
+| `--arrival` | a keyframe's in-between count applies to the transition from the previous keyframe (default: to the next one) |
+| `--debug` | shows `$7000`-type objects, normally hidden, as dashed pink outlines |
 
-Les films se trouvent dans le dossier `Movies` de la disquette Fantavision. Pour les extraire d'une image `.adf`, n'importe quel outil de lecture de disquettes Amiga (OFS) convient.
+The movies are found in the `Movies` folder of the Fantavision disk. To extract them from an `.adf` image, any Amiga floppy (OFS) reader will do.
 
-## Ce qui est géré
+## What is supported
 
-- Polygones pleins, lignes (polylignes) et contours ; morphing même quand le nombre de points change d'une image clé à l'autre (rééchantillonnage).
-- Couleurs interpolées par index de palette, étape par étape, et palette propre à chaque image clé.
-- Bitmaps ILBM (décor de fond et objets), convertis en PNG intégrés, avec transparence sur la couleur 0.
-- Textes (`CSTR`), avec une police de substitution du navigateur.
-- Objets qui apparaissent ou disparaissent d'une image clé à l'autre.
-- Boucle : si la dernière image clé contient des objets, elle se retransforme en la première.
-- Rapport d'aspect des pixels Amiga (NTSC 320×200 affiché en 4:3).
+- Filled polygons, lines (polylines) and outlines; morphing even when the number of points changes from one keyframe to the next (resampling).
+- Colours interpolated by palette index, step by step, with a palette per keyframe.
+- ILBM bitmaps (background and objects), converted to embedded PNG, with colour 0 as transparent.
+- Text (`CSTR`), using a substitute browser font.
+- Objects appearing or disappearing between keyframes.
+- Looping: if the last keyframe still contains objects, it morphs back into the first one.
+- Amiga pixel aspect ratio (NTSC 320×200 displayed as 4:3).
 
-Non géré : les sons 8SVX (le SVG ne joue pas de son) et les polices bitmap Amiga.
+Not supported: 8SVX sounds (SVG cannot play audio) and Amiga bitmap fonts.
 
-## Le format FANT
+## The FANT format
 
-Fichier IFF standard. Tous les nombres sont des mots 16 bits big-endian (signés pour les coordonnées).
+A standard IFF file. All numbers are big-endian 16-bit words (signed for coordinates).
 
 ```
 FORM FANT
-  FHDR (92 o)       en-tête global
-  FORM ILBM ...     décor (si présent) puis bitmaps
-  FORM 8SVX + SEFX  sons et leurs déclenchements
-  FRAM (88 o)       début d'une image clé
-    POLY ...        objets de l'image clé, dans l'ordre d'affichage (arrière -> avant)
-    CSTR ...        texte puis nom de police, pour chaque objet texte
+  FHDR (92 bytes)   global header
+  FORM ILBM ...     background (if any), then bitmaps
+  FORM 8SVX + SEFX  sounds and their triggers
+  FRAM (88 bytes)   start of a keyframe
+    POLY ...        keyframe objects, in drawing order (back -> front)
+    CSTR ...        text then font name, for each text object
   FRAM ...
 ```
 
 ### FHDR
 
-| Offset | Contenu |
+| Offset | Content |
 |---|---|
 | 0 | `$0040` |
 | 2 | `$0010` |
-| 4 | profondeur (5 = 32 couleurs) |
-| 6, 8 | largeur, hauteur (320×200, 352×276…) |
-| 10 | vitesse (0, 2, 15 dans les exemples ; interprétée ici comme un délai en 1/60 s) |
-| 12 | palette : 32 mots `$0RGB` |
-| 76 | nombre d'images clés |
-| 78 | nombre de sons |
-| 80 | nombre de bitmaps (hors décor) |
-| 82 | présence d'un décor (1 = le premier ILBM est le fond) |
+| 4 | depth (5 = 32 colours) |
+| 6, 8 | width, height (320×200, 352×276…) |
+| 10 | speed (0, 2, 15 in the samples; interpreted here as a delay in 1/60 s) |
+| 12 | palette: 32 `$0RGB` words |
+| 76 | number of keyframes |
+| 78 | number of sounds |
+| 80 | number of bitmaps (excluding the background) |
+| 82 | background present (1 = the first ILBM is the background) |
 
 ### FRAM
 
-| Offset | Contenu |
+| Offset | Content |
 |---|---|
-| 0–7 | inconnu (presque toujours 0) |
-| 8 | nombre d'images intermédiaires |
-| 10, 12 | sons déclenchés sur deux voies (-1 = aucun, -2 = arrêt ?) |
-| 14 | nombre de `POLY` qui suivent |
-| 16 | palette de l'image clé : 32 mots `$0RGB` |
+| 0–7 | unknown (almost always 0) |
+| 8 | number of in-between frames |
+| 10, 12 | sounds triggered on two channels (-1 = none, -2 = stop?) |
+| 14 | number of `POLY` chunks that follow |
+| 16 | keyframe palette: 32 `$0RGB` words |
 
 ### POLY
 
-En-tête de 18 mots, puis *n* couples (x, y).
+An 18-word header, followed by *n* (x, y) pairs.
 
-| Mot | Contenu |
+| Word | Content |
 |---|---|
-| 0 | nombre de points *n* |
-| 1 | type et drapeaux : `0` polygone plein, `1` ligne, `2` contour, `3` texte, `$x007` bitmap (`$1007`, `$2007`), `$7000` objet invisible (cadre de groupe ?) |
-| 2 | index de couleur |
-| 3–6 | boîte englobante x1, y1, x2, y2 |
-| 7 | identifiant (non utilisé pour l'appariement) |
-| 8 | toujours 256 |
-| 9 | inconnu (0 à 7) |
-| 10–12 | bitmap : index, largeur, hauteur (le point unique est le centre) |
-| 13–15 | texte : longueur de la chaîne, ?, taille de police << 8 |
+| 0 | number of points *n* |
+| 1 | type and flags: `0` filled polygon, `1` line, `2` outline, `3` text, `$x007` bitmap (`$1007`, `$2007`), `$7000` invisible object (group frame?) |
+| 2 | colour index |
+| 3–6 | bounding box x1, y1, x2, y2 |
+| 7 | identifier (not used for matching) |
+| 8 | always 256 |
+| 9 | unknown (0 to 7) |
+| 10–12 | bitmap: index, width, height (the single point is the centre) |
+| 13–15 | text: string length, ?, font size << 8 |
 
-Deux images clés successives sont appariées objet par objet, selon leur position dans la liste.
+Two consecutive keyframes are matched object by object, by their position in the list.
 
-## Points encore incertains
+## Open questions
 
-- Sens exact du champ vitesse et du compte d'intermédiaires (vers la suivante ou depuis la précédente).
-- Signification des drapeaux `$1000`, `$2000`, `$4000` et du mot 9 des `POLY`.
-- Rôle des objets `$7000`.
-- Premiers mots des `FRAM`.
+- Exact meaning of the speed field and of the in-between count (towards the next keyframe or from the previous one).
+- Meaning of the `$1000`, `$2000`, `$4000` flags and of word 9 in `POLY`.
+- Role of the `$7000` objects.
+- First words of `FRAM`.
 
-La meilleure façon de trancher serait de comparer avec FantaPlayer sous émulateur, ou de désassembler `fantaplayer`. Les contributions sont bienvenues.
+The best way to settle these would be to compare with FantaPlayer under emulation, or to disassemble `fantaplayer`. Contributions are welcome.
 
-## Films (`movies/`)
+## Movies (`movies/`)
 
-Le dossier `movies/` contient les fichiers `FORM FANT` d'origine des films de démonstration de la disquette Fantavision Amiga : *Anthropology*, *Bird*, *Dinosaurs*, *Eyes*, *Jaws* et *PA*. La copie utilisée est la version PAL diffusée en 1988 par le groupe ANC Europe. *PA* (352×276, format PAL) n'est peut-être pas un film Broderbund. Les icônes de deux autres films, *Clock* et *CarCrash!*, sont présentes sur la disquette, mais pas les films eux-mêmes ; un film `anc`, lancé au démarrage par le script de FantaPlayer, manque aussi.
+The `movies/` folder contains the original `FORM FANT` files of the demo movies from the Amiga Fantavision disk: *Anthropology*, *Bird*, *Dinosaurs*, *Eyes*, *Jaws* and *PA*. The copy used is the PAL version released in 1988 by the ANC Europe group. *PA* (352×276, a PAL size) may not be a Broderbund movie. The icons of two other movies, *Clock* and *CarCrash!*, are on the disk, but not the movies themselves; an `anc` movie, played at startup by the FantaPlayer script, is missing too.
 
-Fantavision et ses films de démonstration sont © Broderbund.
+Fantavision and its demo movies are © Broderbund.
