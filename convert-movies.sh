@@ -3,6 +3,7 @@
 # Usage: ./convert-movies.sh [options passed to fant2svg.py, e.g. --step 0.04]
 set -eu
 cd "$(dirname "$0")"
+rm -r svg-output 2>/dev/null
 mkdir -p svg-output
 n=0
 for f in movies/*; do
